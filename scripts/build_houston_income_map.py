@@ -13,7 +13,6 @@ Run:
 import io
 import json
 import os
-import shutil
 import tempfile
 import zipfile
 
@@ -50,7 +49,9 @@ TRACT_SHAPEFILE = os.path.join(
     "tl_2025_48_tract", "tl_2025_48_tract.shp",
 )
 PROCESSED_DIR = os.path.join(_PROJECT_ROOT, "data", "processed")
-OUTPUT_PATH = os.path.join(_PROJECT_ROOT, "output", "houston_income_map.html")
+# public/index.html is the Vercel-deployable output. Vercel serves the public/
+# directory as a static site automatically — no build command needed.
+OUTPUT_PATH = os.path.join(_PROJECT_ROOT, "public", "index.html")
 
 # Census API key — required as of 2025. Set via environment variable or a .env file
 # in the project root. Get a free key at: https://api.census.gov/data/key_signup.html
@@ -438,20 +439,14 @@ def build_income_map(income_gdf):
 
 def save_map(folium_map):
     """
-    Save the Folium map as a standalone HTML file at OUTPUT_PATH.
+    Save the Folium map as a standalone HTML file at public/index.html.
 
-    The repo was initialized with output/houston_income_map.html as a
-    directory (a git placeholder). We detect and remove it before writing
-    so the file can be created in its place.
+    Vercel serves the public/ directory as a static site with no build
+    command required. Committing this file is all that's needed to deploy.
 
     Args:
         folium_map (folium.Map): The completed map.
     """
-    # Remove conflicting directory if it exists (git placeholder artifact)
-    if os.path.isdir(OUTPUT_PATH):
-        shutil.rmtree(OUTPUT_PATH)
-        print(f"  Removed placeholder directory at {OUTPUT_PATH}")
-
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     folium_map.save(OUTPUT_PATH)
     print(f"  Saved: {OUTPUT_PATH}")

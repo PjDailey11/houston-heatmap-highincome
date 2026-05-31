@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+
+# Large debug output — regenerate locally with the script
+data/processed/
