@@ -1,10 +1,32 @@
 """
 scripts/build_houston_income_map.py
 
-Fetches ACS 5-year median household income data for Harris County census tracts,
-clips to Houston city limits, and renders an interactive choropleth map.
+Fetches ACS 5-year median household income data for Texas census tracts,
+selects every tract that intersects the Houston study region (the City of
+Houston plus the incorporated places that touch it — Pasadena, Bellaire, South
+Houston, the enclaves, etc.), and renders an interactive choropleth map.
 
-Output: output/houston_income_map.html
+Output: public/index.html  (served as-is by Vercel's static `public/` directory)
+
+Geometry strategy (the important part)
+--------------------------------------
+The earlier version restricted tracts to Harris County and *clipped* them to the
+City of Houston boundary. That dropped valid areas two ways:
+
+  * Harris-only + a City-of-Houston clip excludes neighbouring cities like
+    Pasadena (a separate municipality) and shaves edge tracts to the city line.
+  * Clipping can also produce empty/degenerate slivers that fall out entirely.
+
+This version replaces the clip with intersection-based *selection*:
+
+  * SELECT, don't clip. Any tract that intersects the study region is kept as a
+    WHOLE tract — edge tracts (the Pasadena side, the ship channel, the western
+    suburbs) are retained intact, not trimmed.
+  * The income join stays a LEFT join, so tracts the Census reports no income
+    for keep their geometry and render in a neutral gray "No data" colour.
+
+Every stage logs its row count, the GEOIDs it drops, and its bounding box to
+data/processed/build_log.txt so the geometry funnel is auditable.
 
 Run:
     python scripts/build_houston_income_map.py
@@ -15,13 +37,14 @@ import json
 import os
 import tempfile
 import zipfile
+from datetime import datetime
 
 import branca.colormap as cm
 import folium
 import geopandas as gpd
 import pandas as pd
 import requests
-from shapely.geometry import MultiPolygon, Polygon
+from shapely import make_valid
 from shapely.ops import unary_union
 
 # ---------------------------------------------------------------------------
@@ -33,13 +56,14 @@ INCOME_FIELD = "B19013_001E"       # ACS field: median household income
 CENSUS_NULL_SENTINEL = -666666666  # Census API integer for suppressed/unavailable values
 
 STATE_FIPS = "48"    # Texas
-COUNTY_FIPS = "201"  # Harris County
 
-# Houston's TIGER/Line place FIPS code (City of Houston, TX)
+# Houston's TIGER/Line place FIPS code (City of Houston, TX). We grow the study
+# region outward from this place by unioning in every place that touches it.
 HOUSTON_PLACE_FP = "35000"
 
 # Texas places shapefile from Census TIGER/Line (~5 MB download)
 TX_PLACES_URL = "https://www2.census.gov/geo/tiger/TIGER2024/PLACE/tl_2024_48_place.zip"
+TX_PLACES_SHP_NAME = "tl_2024_48_place.shp"
 
 # Paths relative to project root (this script lives one level below root)
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -49,9 +73,25 @@ TRACT_SHAPEFILE = os.path.join(
     "tl_2025_48_tract", "tl_2025_48_tract.shp",
 )
 PROCESSED_DIR = os.path.join(_PROJECT_ROOT, "data", "processed")
+LOG_PATH = os.path.join(PROCESSED_DIR, "build_log.txt")
 # public/index.html is the Vercel-deployable output. Vercel serves the public/
 # directory as a static site automatically — no build command needed.
 OUTPUT_PATH = os.path.join(_PROJECT_ROOT, "public", "index.html")
+
+# Coordinate reference systems.
+#   - TIGER/Line ships in EPSG:4269 (NAD83 geographic).
+#   - EPSG:5070 (USA Contiguous Albers Equal Area) is used for spatial
+#     predicates so intersection tests are numerically robust.
+#   - EPSG:4326 (WGS84 lat/lon) is the final CRS because Folium requires it.
+CRS_WGS84 = "EPSG:4326"
+CRS_EQUAL_AREA = "EPSG:5070"
+
+# Map visual settings
+MAP_TILES = "CartoDB Positron"  # Labeled basemap; city/neighborhood names stay visible
+FILL_OPACITY = 0.65             # Semi-transparent so basemap labels show through
+BORDER_COLOR = "#999999"
+BORDER_WEIGHT = 0.5
+NO_DATA_COLOR = "#cccccc"       # Neutral gray for tracts with no income estimate
 
 # Census API key — required as of 2025. Set via environment variable or a .env file
 # in the project root. Get a free key at: https://api.census.gov/data/key_signup.html
@@ -73,11 +113,55 @@ def _load_census_api_key():
 
 CENSUS_API_KEY = _load_census_api_key()
 
-# Map visual settings
-MAP_TILES = "CartoDB Positron"  # Labeled basemap; city/neighborhood names stay visible
-FILL_OPACITY = 0.65             # Semi-transparent so basemap labels show through
-BORDER_COLOR = "#999999"
-BORDER_WEIGHT = 0.5
+
+# ---------------------------------------------------------------------------
+# Logging — buffered to build_log.txt so the geometry funnel is auditable even
+# when the terminal truncates output.
+# ---------------------------------------------------------------------------
+
+_log_lines = []
+
+
+def log(message):
+    """Record an audit line to both stdout and the build_log.txt buffer."""
+    stamped = f"[{datetime.now():%H:%M:%S}] {message}"
+    print(stamped)
+    _log_lines.append(stamped)
+
+
+def flush_log():
+    """Write the accumulated audit trail to data/processed/build_log.txt."""
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    with open(LOG_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(_log_lines) + "\n")
+
+
+def log_bbox(gdf, label):
+    """Log a layer's bounding box so extents can be compared across stages."""
+    minx, miny, maxx, maxy = gdf.total_bounds
+    log(f"bbox [{label}]: x[{minx:.4f}, {maxx:.4f}] y[{miny:.4f}, {maxy:.4f}]")
+
+
+def repair_geometries(gdf, label):
+    """Drop null geometries and repair invalid ones via make_valid.
+
+    Invalid geometries (self-intersections, bow-ties) make spatial predicates
+    return wrong or empty results — a subtle way tracts vanish. We fix them in
+    place rather than dropping them.
+    """
+    null_count = int(gdf.geometry.isna().sum())
+    if null_count:
+        log(f"  {label}: dropping {null_count} null geometries")
+        gdf = gdf[gdf.geometry.notna()].copy()
+
+    invalid_mask = ~gdf.geometry.is_valid
+    invalid_count = int(invalid_mask.sum())
+    if invalid_count:
+        log(f"  {label}: repairing {invalid_count} invalid geometries (make_valid)")
+        gdf.loc[invalid_mask, "geometry"] = gdf.loc[invalid_mask, "geometry"].apply(
+            make_valid
+        )
+    return gdf
 
 
 # ---------------------------------------------------------------------------
@@ -87,14 +171,14 @@ BORDER_WEIGHT = 0.5
 def fetch_acs_income_data():
     """
     Query the Census ACS 5-year API for tract-level median household income
-    in Harris County, Texas.
+    across all of Texas.
+
+    We pull the whole state in one request (rather than a single county) because
+    the Houston study region spans several counties; a statewide pull guarantees
+    an income row for every tract we might select.
 
     The API returns a JSON array where the first element is the column header
     row and each subsequent element is a data row. We zip them into dicts.
-
-    The Census API uses multiple `in=` parameters to specify the geography
-    hierarchy (state, then county). Passing them as a list of tuples ensures
-    requests serializes them as separate URL parameters.
 
     Returns:
         list[dict]: Each dict has keys NAME, B19013_001E, state, county, tract.
@@ -107,17 +191,15 @@ def fetch_acs_income_data():
             "          or export CENSUS_API_KEY=your_key_here  (Mac/Linux)"
         )
 
-    # List of tuples preserves duplicate parameter names (two separate `in=` values)
     params = [
         ("get", f"NAME,{INCOME_FIELD}"),
         ("for", "tract:*"),
         ("in", f"state:{STATE_FIPS}"),
-        ("in", f"county:{COUNTY_FIPS}"),
         ("key", CENSUS_API_KEY),
     ]
 
-    print("  Querying Census ACS 5-year API for Harris County tract income ...")
-    response = requests.get(ACS_API_URL, params=params, timeout=30)
+    log("  Querying Census ACS 5-year API for Texas tract income ...")
+    response = requests.get(ACS_API_URL, params=params, timeout=60)
     response.raise_for_status()
 
     # If the API returns HTML instead of JSON, the key may be invalid
@@ -135,43 +217,47 @@ def fetch_acs_income_data():
 
 def load_tract_geometries():
     """
-    Load Census TIGER/Line tract geometry from the local shapefile, filtered
-    to Harris County.
+    Load Census TIGER/Line tract geometry for all of Texas from the local
+    shapefile, standardized to WGS84 and with geometries repaired.
 
-    The shapefile covers all of Texas (~5,000 tracts). Filtering immediately
-    to Harris County (COUNTYFP == '201') keeps the spatial pipeline fast.
+    We deliberately do NOT pre-filter to a single county: the Houston study
+    region spills into Fort Bend, Galveston, Montgomery and others, and a county
+    filter is a common source of edge gaps. Spatial selection narrows it later.
 
     The GEOID column in TIGER/Line is the 11-character string formed by
     concatenating STATEFP + COUNTYFP + TRACTCE (e.g. "48201001234").
 
     Returns:
-        GeoDataFrame: Harris County census tracts in their native CRS (EPSG:4269).
+        GeoDataFrame: Texas census tracts in EPSG:4326.
     """
-    print("  Reading Harris County tracts from local TIGER/Line shapefile ...")
+    log("  Reading Texas tracts from local TIGER/Line shapefile ...")
     gdf = gpd.read_file(TRACT_SHAPEFILE)
-    harris = gdf[gdf["COUNTYFP"] == COUNTY_FIPS].copy()
-    print(f"  Loaded {len(harris)} Harris County tracts.")
-    return harris
+    log(f"  Raw tracts loaded (statewide): {len(gdf)} in CRS {gdf.crs}")
+
+    gdf = gdf.to_crs(CRS_WGS84)
+    gdf = repair_geometries(gdf, "tracts")
+    return gdf
 
 
-def load_houston_boundary():
+def load_houston_study_region():
     """
-    Download the Texas places TIGER/Line shapefile and extract the Houston
-    city limits polygon.
+    Download the Texas places TIGER/Line shapefile and build the Houston study
+    region: the City of Houston unioned with every incorporated place that
+    touches it.
 
-    We download to memory, unzip to a temp directory, read with GeoPandas,
-    then filter to Houston (PLACEFP == '35000'). The temp directory is
-    cleaned up automatically after the read.
-
-    The shapefile uses EPSG:4269 (NAD83); callers handle reprojection.
+    Why "touching places" rather than just Houston: Pasadena and the inner-ring
+    edge areas the map needs are *separate* incorporated cities, so a strict
+    Houston-only boundary erases them. Including every place that touches Houston
+    also captures the enclaves (Bellaire, West University Place, ...) that sit as
+    holes inside Houston, filling what would otherwise be donut-shaped gaps.
 
     Returns:
-        GeoDataFrame: Single-row GeoDataFrame for the City of Houston.
+        shapely geometry: the unioned study region in EPSG:4326.
 
     Raises:
         ValueError: If Houston is not found in the downloaded places file.
     """
-    print("  Downloading Texas places shapefile from Census TIGER/Line (~5 MB) ...")
+    log("  Downloading Texas places shapefile from Census TIGER/Line (~5 MB) ...")
     response = requests.get(TX_PLACES_URL, timeout=120)
     response.raise_for_status()
 
@@ -179,111 +265,64 @@ def load_houston_boundary():
     with zipfile.ZipFile(zip_bytes) as zf:
         with tempfile.TemporaryDirectory() as tmpdir:
             zf.extractall(tmpdir)
-            shp_path = os.path.join(tmpdir, "tl_2024_48_place.shp")
-            all_places = gpd.read_file(shp_path)
+            all_places = gpd.read_file(os.path.join(tmpdir, TX_PLACES_SHP_NAME))
 
-    houston = all_places[all_places["PLACEFP"] == HOUSTON_PLACE_FP].copy()
+    all_places = all_places.to_crs(CRS_WGS84)
+    all_places = repair_geometries(all_places, "places")
+
+    houston = all_places[all_places["PLACEFP"] == HOUSTON_PLACE_FP]
     if houston.empty:
         raise ValueError(
             f"Houston (PLACEFP='{HOUSTON_PLACE_FP}') not found in the Texas places file. "
             f"Source URL: {TX_PLACES_URL}"
         )
+    houston_geom = unary_union(houston.geometry.values)
 
-    print(f"  Loaded city boundary for: {houston.iloc[0]['NAME']}")
-    return houston
+    # Adjacent = any place whose geometry intersects Houston (a shared border
+    # counts as touching). Intentionally inclusive.
+    touching = all_places[all_places.geometry.intersects(houston_geom)]
+    study_region = make_valid(unary_union(touching.geometry.values))
+
+    names = sorted(touching["NAME"].unique().tolist())
+    log(f"  Study region = Houston + {len(touching) - 1} touching places")
+    log("  Contributing places: " + ", ".join(names))
+    return study_region
 
 
 # ---------------------------------------------------------------------------
 # Spatial processing
 # ---------------------------------------------------------------------------
 
-def clip_tracts_to_houston(harris_tracts, houston_boundary):
+def select_tracts_intersecting_region(tracts, study_region):
     """
-    Clip Harris County census tracts to the Houston city limits polygon.
+    Keep every WHOLE tract that intersects the study region.
 
-    Spatial clip operations require a projected CRS (in meters) to correctly
-    handle boundary edges and thin slivers. We reproject both layers to
-    EPSG:3857 (Web Mercator) for the clip, then return the result in WGS84
-    (EPSG:4326) because Folium requires longitude/latitude coordinates.
+    This deliberately replaces gpd.clip: clipping cuts tracts along the region
+    boundary and can drop tracts whose clipped piece becomes empty.
+    Intersection-based selection keeps the full tract polygon, so edge tracts
+    (e.g. on the Pasadena side) are retained intact.
 
-    Tracts that partially overlap the Houston boundary have their geometry
-    trimmed to the city edge; fully interior tracts are kept whole.
+    The predicate runs in an equal-area CRS for numerical robustness; the
+    returned geometries are the untouched WGS84 originals.
 
     Args:
-        harris_tracts (GeoDataFrame): Harris County tracts in any CRS.
-        houston_boundary (GeoDataFrame): Houston city limits polygon in any CRS.
+        tracts (GeoDataFrame): Texas tracts in EPSG:4326.
+        study_region (shapely geometry): the Houston study region in EPSG:4326.
 
     Returns:
-        GeoDataFrame: Tracts clipped to Houston in EPSG:4326.
+        GeoDataFrame: selected whole tracts in EPSG:4326.
     """
-    print("  Reprojecting to EPSG:3857 and clipping tracts to Houston city limits ...")
+    log("  Selecting tracts that intersect the study region (whole tracts) ...")
+    region_ea = gpd.GeoSeries([study_region], crs=CRS_WGS84).to_crs(CRS_EQUAL_AREA).iloc[0]
+    tracts_ea = tracts.to_crs(CRS_EQUAL_AREA)
 
-    tracts_proj = harris_tracts.to_crs("EPSG:3857")
-    houston_proj = houston_boundary.to_crs("EPSG:3857")
+    mask = tracts_ea.geometry.intersects(region_ea)
+    selected = tracts[mask.values].copy()  # keep the original WGS84 geometry
 
-    # Houston's city boundary polygon has interior holes where independent
-    # incorporated enclaves (Bellaire, West University Place) are located.
-    # A strict clip would drop any tract entirely within those holes.
-    # We fill the holes first so enclave tracts are kept in the output.
-    houston_filled = _fill_polygon_holes(houston_proj.geometry.iloc[0])
-    houston_mask = gpd.GeoDataFrame(geometry=[houston_filled], crs=houston_proj.crs)
-
-    clipped = gpd.clip(tracts_proj, houston_mask)
-    clipped_wgs84 = clipped.to_crs("EPSG:4326")
-
-    # Clipping at the city boundary produces GeometryCollections (when a tract
-    # edge touches the boundary at only a point or line) and occasionally
-    # degenerate LineString/Point results. Keep only valid polygon features.
-    clipped_wgs84 = _normalize_geometry(clipped_wgs84)
-
-    print(f"  {len(clipped_wgs84)} tracts remain within Houston area.")
-    return clipped_wgs84
-
-
-def _fill_polygon_holes(geom):
-    """
-    Remove all interior holes (rings) from a Polygon or MultiPolygon.
-
-    Houston's TIGER/Line boundary has interior holes where independent
-    incorporated enclaves (Bellaire, West University Place) are located.
-    Filling those holes before clipping ensures we keep tracts that fall
-    entirely within the enclave areas.
-    """
-    if geom.geom_type == "Polygon":
-        return Polygon(geom.exterior)
-    if geom.geom_type == "MultiPolygon":
-        return MultiPolygon([Polygon(p.exterior) for p in geom.geoms])
-    return geom
-
-
-def _normalize_geometry(gdf):
-    """
-    Ensure every feature has a clean Polygon or MultiPolygon geometry.
-
-    geopandas.clip() can produce GeometryCollections (a mix of polygon,
-    line, and point components) when a tract edge only touches the clip
-    boundary at a line or point. It can also produce pure LineString or
-    Point results in rare edge cases. Both break Folium tooltips and
-    choropleth rendering, so we extract only the polygon parts and drop
-    any feature with no polygon area.
-    """
-    def extract_polygons(geom):
-        if geom is None or geom.is_empty:
-            return None
-        if geom.geom_type in ("Polygon", "MultiPolygon"):
-            return geom
-        if geom.geom_type == "GeometryCollection":
-            poly_parts = [g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon")]
-            if not poly_parts:
-                return None
-            return unary_union(poly_parts)
-        # LineString, Point, and other non-area geometry types have no fill;
-        # they are degenerate clip artifacts and should be dropped.
-        return None
-
-    result = gdf.copy()
-    result["geometry"] = result["geometry"].apply(extract_polygons)
-    return result[result["geometry"].notna()].reset_index(drop=True)
+    dropped = sorted(set(tracts["GEOID"]) - set(selected["GEOID"]))
+    log(f"  Tracts intersecting study region: {len(selected)} of {len(tracts)}")
+    log(f"  Tracts excluded (outside region): {len(dropped)}")
+    return selected
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +338,7 @@ def _format_income(value):
 
 def prepare_income_geodataframe(acs_rows, houston_tracts):
     """
-    Join ACS income data to Houston tract geometry by GEOID.
+    Join ACS income data to the selected tract geometry by GEOID.
 
     The ACS API returns geography as three separate fields (state, county,
     tract). We concatenate them into an 11-character GEOID string — matching
@@ -312,11 +351,11 @@ def prepare_income_geodataframe(acs_rows, houston_tracts):
 
     Args:
         acs_rows (list[dict]): Raw rows from the ACS API response.
-        houston_tracts (GeoDataFrame): Tracts clipped to Houston in EPSG:4326.
+        houston_tracts (GeoDataFrame): Selected tracts in EPSG:4326.
 
     Returns:
-        GeoDataFrame: Houston tracts with 'income' (float), 'income_label'
-                      (str), and 'tract_name' (str) columns. CRS: EPSG:4326.
+        GeoDataFrame: tracts with 'income' (float), 'income_label' (str), and
+                      'display_name' (str) columns. CRS: EPSG:4326.
     """
     income_df = pd.DataFrame(acs_rows)
 
@@ -327,27 +366,29 @@ def prepare_income_geodataframe(acs_rows, houston_tracts):
     income_df["income"] = pd.to_numeric(income_df[INCOME_FIELD], errors="coerce")
     income_df.loc[income_df["income"] == CENSUS_NULL_SENTINEL, "income"] = float("nan")
 
-    income_df = income_df.rename(columns={"NAME": "tract_name"})
+    income_df = income_df.rename(columns={"NAME": "acs_name"})
 
-    # Left join: keeps all Houston tracts even if the ACS has no income value.
-    # The join key must match exactly: both sides are 11-char zero-padded strings.
+    # LEFT join: keeps every selected tract even when the ACS has no income value
+    # for it. The join key must match exactly: both sides are 11-char strings.
+    before = len(houston_tracts)
     merged = houston_tracts.merge(
-        income_df[["GEOID", "tract_name", "income"]],
+        income_df[["GEOID", "acs_name", "income"]],
         on="GEOID",
         how="left",
     )
+    assert len(merged) == before, "row count changed during join (duplicate GEOIDs?)"
 
     # NAMELSAD ("Census Tract 3508.03") comes from the TIGER/Line shapefile and
     # is always present for every tract. Use it as the primary display name in
     # tooltips so the name is never missing, even when the ACS join doesn't match.
-    merged["display_name"] = merged["NAMELSAD"].fillna(merged["NAME"]).fillna("Unknown tract")
+    merged["display_name"] = merged["NAMELSAD"].fillna(merged["acs_name"]).fillna("Unknown tract")
 
     # Pre-format income as a currency string for use in map tooltips
     merged["income_label"] = merged["income"].apply(_format_income)
 
-    n_missing = merged["income"].isna().sum()
-    if n_missing > 0:
-        print(f"  Note: {n_missing} tract(s) have no income data (shown in gray).")
+    n_missing = int(merged["income"].isna().sum())
+    log(f"  Tracts after income join: {len(merged)} (kept all selected tracts)")
+    log(f"  Tracts with no income (rendered gray 'No data'): {n_missing}")
 
     return merged
 
@@ -370,11 +411,11 @@ def build_income_map(income_gdf):
       per-feature styling and GeoJsonTooltip, which Choropleth does not
       support as cleanly.
     - fillOpacity=0.65: keeps CartoDB city/neighborhood labels legible.
-    - Gray fill (#cccccc): tracts with no income data are shown neutrally
-      rather than at the bottom of the income color scale.
+    - Gray fill: tracts with no income data are shown neutrally rather than at
+      the bottom of the income color scale.
 
     Args:
-        income_gdf (GeoDataFrame): Merged Houston tracts + income in EPSG:4326.
+        income_gdf (GeoDataFrame): Merged tracts + income in EPSG:4326.
 
     Returns:
         folium.Map: Completed map ready to save.
@@ -399,7 +440,7 @@ def build_income_map(income_gdf):
         """Return Folium polygon fill and border styles for a single tract."""
         income = feature["properties"].get("income")
         # JSON null deserializes to Python None; show gray for missing income data
-        fill_color = colormap(income) if income is not None else "#cccccc"
+        fill_color = colormap(income) if income is not None else NO_DATA_COLOR
         return {
             "fillColor": fill_color,
             "color": BORDER_COLOR,
@@ -421,13 +462,14 @@ def build_income_map(income_gdf):
         geojson_dict,
         name="Median Household Income",
         style_function=style_function,
+        highlight_function=lambda _f: {"weight": 2.0, "color": "#000000"},
         tooltip=tooltip,
     ).add_to(m)
 
     # Attach the Spectral color legend bar to the map
     colormap.add_to(m)
 
-    # Zoom the initial view to fit all Houston tracts
+    # Zoom the initial view to fit all rendered tracts
     m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 
     return m
@@ -449,7 +491,7 @@ def save_map(folium_map):
     """
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     folium_map.save(OUTPUT_PATH)
-    print(f"  Saved: {OUTPUT_PATH}")
+    log(f"  Saved: {OUTPUT_PATH}")
 
 
 # ---------------------------------------------------------------------------
@@ -461,52 +503,56 @@ def main():
     Orchestrate the full data pipeline from API call to HTML output.
 
     Steps:
-        1. Fetch ACS median household income for Harris County tracts
-        2. Load Harris County tract geometry from the local TIGER/Line shapefile
-        3. Download Houston city boundary from the Census TIGER/Line places file
-        4. Clip Harris County tracts to Houston city limits
-        5. Join income data to tract geometry by GEOID
+        1. Fetch ACS median household income for all Texas tracts
+        2. Load Texas tract geometry from the local TIGER/Line shapefile
+        3. Build the Houston study region (Houston + touching places)
+        4. Select tracts that intersect the study region (whole tracts)
+        5. Join income data to tract geometry by GEOID (LEFT join)
         6. Build the interactive Folium choropleth map
         7. Save the HTML map and a debug GeoJSON
     """
-    print("=== Houston Income Heatmap Builder ===\n")
+    log("=== Houston Income Heatmap Builder ===")
 
-    print("[1/7] Fetching ACS income data ...")
+    log("[1/7] Fetching ACS income data ...")
     acs_rows = fetch_acs_income_data()
-    print(f"      Received {len(acs_rows)} tract rows from the Census API.\n")
+    log(f"      Received {len(acs_rows)} tract rows from the Census API.")
 
-    print("[2/7] Loading Harris County tract geometry ...")
-    harris_tracts = load_tract_geometries()
-    print()
+    log("[2/7] Loading Texas tract geometry ...")
+    tracts = load_tract_geometries()
+    log_bbox(tracts, "all TX tracts")
 
-    print("[3/7] Loading Houston city boundary ...")
-    houston_boundary = load_houston_boundary()
-    print()
+    log("[3/7] Building Houston study region ...")
+    study_region = load_houston_study_region()
 
-    print("[4/7] Clipping tracts to Houston city limits ...")
-    houston_tracts = clip_tracts_to_houston(harris_tracts, houston_boundary)
-    print()
+    log("[4/7] Selecting tracts that intersect the study region ...")
+    selected_tracts = select_tracts_intersecting_region(tracts, study_region)
+    log_bbox(selected_tracts, "selected tracts")
 
-    print("[5/7] Joining income data to tract geometry ...")
-    income_gdf = prepare_income_geodataframe(acs_rows, houston_tracts)
-    print(f"      Final dataset: {len(income_gdf)} Houston tracts.\n")
+    log("[5/7] Joining income data to tract geometry ...")
+    income_gdf = prepare_income_geodataframe(acs_rows, selected_tracts)
+    log(f"      Final dataset: {len(income_gdf)} tracts.")
 
-    print("[6/7] Building Folium map ...")
+    log("[6/7] Building Folium map ...")
     folium_map = build_income_map(income_gdf)
-    print()
 
-    print("[7/7] Saving output ...")
+    log("[7/7] Saving output ...")
     save_map(folium_map)
 
     # Save a processed GeoJSON for debugging / inspection in QGIS or similar
     os.makedirs(PROCESSED_DIR, exist_ok=True)
     processed_path = os.path.join(PROCESSED_DIR, "houston_tracts_income.geojson")
     income_gdf.to_file(processed_path, driver="GeoJSON")
-    print(f"  Debug GeoJSON: {processed_path}")
+    log(f"  Debug GeoJSON: {processed_path}")
 
-    print("\n=== Done! ===")
-    print(f"Open in a browser: {OUTPUT_PATH}")
+    log("=== Done! ===")
+    log(f"Open in a browser: {OUTPUT_PATH}")
+    flush_log()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:  # make sure failures land in the log file too
+        log(f"BUILD FAILED: {type(exc).__name__}: {exc}")
+        flush_log()
+        raise
